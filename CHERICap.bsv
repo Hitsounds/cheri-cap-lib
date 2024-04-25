@@ -109,6 +109,9 @@ typedef struct {
   Bit #(addrW) mask;
 } SetBoundsReturn #(type capT, numeric type addrW) deriving (Bits, Eq, FShow);
 
+// ROPE CORE: pipelined setbounds intermediate interface
+
+
 // helper function to test belonging to a range
 function Bool belongsToRange ( Bit #(n) x, Bit #(n) low, Bit #(n) high
                              , Bool highIncluded);
@@ -119,7 +122,7 @@ endfunction
 
 // XXX TODO augment with all architectural bounds/ repbounds ?
 function Fmt showCHERICap (capT cap)
-  provisos (CHERICap #(capT , otypeW, flgW, addrW, inMemW, maskableW));
+  provisos (CHERICap #(capT , otypeW, flgW, addrW, inMemW, maskableW, setBoundsIntermediary));
   return $format( "Valid: 0x%0x", isValidCap(cap)) +
          $format(" Perms: 0x%0x", getPerms(cap)) +
          $format(" Kind: ", fshow(getKind(cap))) +
@@ -153,8 +156,9 @@ typeclass CHERICap #( type capT              // type of the CHERICap capability
                     , numeric type addrW     // width of the address
                     , numeric type inMemW    // width of the capability in mem
                     , numeric type maskableW // width of maskable bits
+                    , type setBoundsIntermediary
                     )
-  dependencies (capT determines (otypeW, flgW, addrW, inMemW, maskableW));
+  dependencies (capT determines (otypeW, flgW, addrW, inMemW, maskableW, setBoundsIntermediary));
 
   // capability validity
   //////////////////////////////////////////////////////////////////////////////
@@ -293,14 +297,19 @@ typeclass CHERICap #( type capT              // type of the CHERICap capability
   //////////////////////////////////////////////////////////////////////////////
 
   // Set the length of the capability
-  function SetBoundsReturn #(capT, addrW)
-    setBoundsCombined (capT cap, Bit #(addrW) length);
+  function SetBoundsReturn #(capT, addrW) setBoundsCombined (capT cap, Bit #(addrW) length);
   // Set the length of the capability. Inexact: result length may be different
   // to requested
   function Exact #(capT) setBounds (capT cap, Bit #(addrW) length);
-    let combinedResult = setBoundsCombined (cap, length);
+    let combinedResult = setBoundsCombined(cap, length);
     return Exact {exact: combinedResult.exact, value: combinedResult.cap};
   endfunction
+
+  
+  function setBoundsIntermediary setBounds_a (capT cap, Bit #(addrW) length);
+
+  function Exact #(capT) setBounds_b (setBoundsIntermediary inter);
+
   // Round a requested length (requires a dummy proxy)
   function Bit #(addrW) roundLength (capT dummy, Bit #(addrW) reqLength) =
     setBoundsCombined (nullCapFromDummy (dummy), reqLength).length;

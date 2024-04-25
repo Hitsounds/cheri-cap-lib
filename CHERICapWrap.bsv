@@ -30,7 +30,9 @@ package CHERICapWrap;
 import CHERICap :: *;
 import CHERICC_Fat :: *;
 
+
 `define CAPTYPE CapPipe
+`define SB_INTER_TYPE SetBoundsIntermediary
 `ifndef CAP64
 `define W(name) wrap128_``name
 `else
@@ -101,5 +103,12 @@ function Bit#(CapAddrW) `W(getRepresentableAlignmentMask) (`CAPTYPE dummy, Bit#(
 function Bit#(CapAddrW) `W(getRepresentableLength) (`CAPTYPE dummy, Bit#(CapAddrW) length) = roundLength (dummy, length);
 (* noinline *)
 function Bit#(2) `W(getBaseAlignment) (`CAPTYPE cap) = getBaseAlignment(cap);
+//TODO: Add functions for generating the separate parts
+
+(* noinline *)
+function `SB_INTER_TYPE `W(setBounds_a) (`CAPTYPE cap, Bit#(CapAddrW) length) = setBounds_a(cap, length);
+
+(* noinline *)
+function Exact#(`CAPTYPE) `W(setBounds_b) (`SB_INTER_TYPE inter ) = setBounds_b(inter);
 
 endpackage

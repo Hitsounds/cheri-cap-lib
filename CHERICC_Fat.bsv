@@ -58,6 +58,9 @@ export PermsW;
 export Exp;
 export MetaInfo;
 export SetBoundsReturn;
+export SetBoundsIntermediary;
+export CapAddr;
+export CapAddrPlus2;
 export CapTrim;
 export trimCap;
 export untrimCap;
@@ -171,6 +174,24 @@ Bit#(OTypeW) otype_unsealed = -1;
 Bit#(OTypeW) otype_sentry   = -2;
 Bit#(OTypeW) otype_res0     = -3;
 Bit#(OTypeW) otype_res1     = -4;
+
+typedef struct {
+  CapFat cap;
+  CapFat ret;
+  TempFields tf;
+  Exp e;
+  Bool intExp;
+  Bool exact;
+  Bool lostSignificantLen;
+  Bool lostSignificantTop;
+  Bool lengthIsMax;
+  CapAddr length;
+  CapAddrPlus2 len;
+  CapAddrPlus2 top;
+  CapAddrPlus2 lmask;
+  CapAddrPlus2 lmaskLo;
+  CapAddrPlus2 lmaskLor;
+} SetBoundsIntermediary deriving (Bits);
 
 // unpacked capability format
 typedef struct {
@@ -494,6 +515,235 @@ function Bit#(n) smearMSBRight(Bit#(n) x);
   return res;
 endfunction
 
+/* #### BEGIN Pipelined SetBounds #### */
+
+function SetBoundsIntermediary setBoundsFat_a(CapFat cap, Address lengthFull, TempFields tf);
+  CapFat ret = cap;
+  // Find new exponent by finding the index of the most significant bit of the
+  // length, or counting leading zeros in the high bits of the length, and
+  // substracting them to the CapAddr width (taking away the bottom MW-1 bits:
+  // trim (MW-1) bits from the bottom of length since any length with a
+  // significance that small will yield an exponent of zero).
+  CapAddr length = truncate(lengthFull);
+  Bit#(TSub#(CapAddrW,TSub#(MW,1))) lengthMSBs = truncateLSB(length);
+  Exp zeros = zeroExtend(countZerosMSB(lengthMSBs));
+  // Adjust resetExp by one since it's scale reaches 1-bit greater than a
+  // 64-bit length can express.
+  Bool maxZero = (zeros==(resetExp-1));
+  Bool intExp = !(maxZero && length[fromInteger(valueOf(TSub#(MW,2)))]==1'b0);
+  // Do this without subtraction
+  //fromInteger(valueof(TSub#(SizeOf#(Address),TSub#(MW,1)))) - zeros;
+  Exp e = (resetExp-1) - zeros;
+  // Derive new base bits by extracting MW bits from the capability address
+  // starting at the new exponent's position.
+  CapAddrPlus2 base = {2'b0, cap.address};
+  Bit#(TAdd#(MW,1)) newBaseBits = truncate(base>>e);
+
+  // Derive new top bits by extracting MW bits from the capability address +
+  // requested length, starting at the new exponent's position, and rounding up
+  // if significant bits are lost in the process.
+  CapAddrPlus2 len = {2'b0, length};
+  CapAddrPlus2 top = base + len;
+
+  // Create a mask with all bits set below the MSB of length and then masking
+  // all bits below the mantissa bits.
+  CapAddrPlus2 lmask = smearMSBRight(len);
+  // The shift amount required to put the most significant set bit of the len
+  // just above the bottom HalfExpW bits that are taken by the exp.
+  Integer shiftAmount = valueOf(TSub#(TSub#(MW,2),HalfExpW));
+
+  // Calculate all values associated with E=e (e not rounding up)
+  // Round up considering the stolen HalfExpW exponent bits if required
+  Bit#(TAdd#(MW,1)) newTopBits = truncate(top>>e);
+  // Check if non-zero bits were lost in the low bits of top, either in the 'e'
+  // shifted out bits or in the HalfExpW bits stolen for the exponent
+  // Shift by MW-1 to move MSB of mask just below the mantissa, then up
+  // HalfExpW more to take in the bits that will be lost for the exponent when
+  // it is non-zero.
+  CapAddrPlus2 lmaskLor = lmask>>fromInteger(shiftAmount+1);
+  CapAddrPlus2 lmaskLo  = lmask>>fromInteger(shiftAmount);
+  // For the len, we're not actually losing significance since we're not
+  // storing it, we just want to know if any low bits are non-zero so that we
+  // will know if it will cause the total length to round up.
+  Bool lostSignificantLen  = (len&lmaskLor)!=0 && intExp;
+  Bool lostSignificantTop  = (top&lmaskLor)!=0 && intExp;
+  // Check if non-zero bits were lost in the low bits of base, either in the
+  // 'e' shifted out bits or in the HalfExpW bits stolen for the exponent
+  Bool lostSignificantBase = (base&lmaskLor)!=0 && intExp;
+
+  // Calculate all values associated with E=e+1 (e rounding up due to msb of L
+  // increasing by 1) This value is just to avoid adding later.
+  Bit#(MW) newTopBitsHigher = truncateLSB(newTopBits);
+  // Check if non-zero bits were lost in the low bits of top, either in the 'e'
+  // shifted out bits or in the HalfExpW bits stolen for the exponent Shift by
+  // MW-1 to move MSB of mask just below the mantissa, then up HalfExpW more to
+  // take in the bits that will be lost for the exponent when it is non-zero.
+  Bool lostSignificantTopHigher  = (top&lmaskLo)!=0 && intExp;
+  // Check if non-zero bits were lost in the low bits of base, either in the
+  // 'e' shifted out bits or in the HalfExpW bits stolen for the exponent
+  Bool lostSignificantBaseHigher = (base&lmaskLo)!=0 && intExp;
+  // If either base or top lost significant bits and we wanted an exact
+  // setBounds, void the return capability
+
+  // We need to round up Exp if the msb of length will increase.
+  // We can check how much the length will increase without looking at the
+  // result of adding the length to the base.  We do this by adding the lower
+  // bits of the length to the base and then comparing both halves (above and
+  // below the mask) to zero.  Either side that is non-zero indicates an extra
+  // "1" that will be added to the "mantissa" bits of the length, potentially
+  // causing overflow.  Finally check how close the requested length is to
+  // overflow, and test in relation to how much the length will increase.
+  CapAddrPlus2 topLo = (lmaskLor & len) + (lmaskLor & base);
+  CapAddrPlus2 mwLsbMask = lmaskLor ^ lmaskLo;
+  // If the first bit of the mantissa of the top is not the sum of the
+  // corrosponding bits of base and length, there was a carry in.
+  Bool lengthCarryIn = (mwLsbMask & top) != ((mwLsbMask & base)^(mwLsbMask & len));
+  Bool lengthRoundUp = lostSignificantTop;
+  Bool lengthIsMax        = (len & (~lmaskLor)) == (lmask ^ lmaskLor);
+  Bool lengthIsMaxLessOne = (len & (~lmaskLor)) == (lmask ^ lmaskLo);
+
+  Bool lengthOverflow = False;
+  if (lengthIsMax && (lengthCarryIn || lengthRoundUp)) lengthOverflow = True;
+  if (lengthIsMaxLessOne && lengthCarryIn && lengthRoundUp) lengthOverflow = True;
+
+  if(lengthOverflow && intExp) begin
+    e = e+1;
+    ret.bounds.topBits = lostSignificantTopHigher ? newTopBitsHigher + 'b1000
+                                                  : newTopBitsHigher;
+    ret.bounds.baseBits = truncateLSB(newBaseBits);
+  end else begin
+    ret.bounds.topBits = lostSignificantTop ? truncate(newTopBits + 'b1000)
+                                            : truncate(newTopBits);
+    ret.bounds.baseBits = truncate(newBaseBits);
+  end
+  Bool exact = !(lostSignificantBase || lostSignificantTop);
+
+  return SetBoundsIntermediary { ret:    ret
+                                , cap:  cap
+                                , tf: tf
+                                , e: e
+                                , intExp: intExp
+                                , exact: exact
+                                , lostSignificantLen: lostSignificantLen
+                                , lostSignificantTop: lostSignificantTop
+                                , lengthIsMax: lengthIsMax
+                                , length: length
+                                , len: len
+                                , top: top
+                                , lmask: lmask
+                                , lmaskLo: lmaskLo
+                                , lmaskLor: lmaskLor
+                                };
+
+endfunction
+
+function SetBoundsReturn#(CapFat, CapAddrW) setBoundsFat_b(SetBoundsIntermediary a_intermediates);
+  CapFat ret = a_intermediates.ret;
+  CapFat cap = a_intermediates.cap;
+  TempFields tf = a_intermediates.tf;
+  Exp e = a_intermediates.e;
+  Bool intExp = a_intermediates.intExp;
+  Bool exact = a_intermediates.exact;
+  Bool lostSignificantLen = a_intermediates.lostSignificantLen;
+  Bool lostSignificantTop = a_intermediates.lostSignificantTop;
+  Bool lengthIsMax = a_intermediates.lengthIsMax;
+  CapAddr length = a_intermediates.length;
+  CapAddrPlus2 len = a_intermediates.len;
+  CapAddrPlus2 top = a_intermediates.top;
+  CapAddrPlus2 lmask = a_intermediates.lmask;
+  CapAddrPlus2 lmaskLo = a_intermediates.lmaskLo;
+  CapAddrPlus2 lmaskLor = a_intermediates.lmaskLor;
+
+
+  CapAddrPlus2 base = {2'b0, cap.address};
+
+  Integer shiftAmount = valueOf(TSub#(TSub#(MW,2),HalfExpW));
+  ret.bounds.exp = e;
+  // Update the addrBits fields
+  ret.addrBits = ret.bounds.baseBits;
+  // Derive new format from newly computed exponent value, and round top up if
+  // necessary
+  if (!intExp) begin // If we have an Exp of 0 and no implied MSB of L.
+    ret.format = Exp0;
+  end else begin
+    ret.format = EmbeddedExp;
+    Bit#(HalfExpW) botZeroes = 0;
+    ret.bounds.baseBits = {truncateLSB(ret.bounds.baseBits), botZeroes};
+    ret.bounds.topBits  = {truncateLSB(ret.bounds.topBits),  botZeroes};
+  end
+
+  // Begin calculate newLength in case this is a request just for a
+  // representable length:
+  CapAddrPlus2 newLength = {2'b0, length};
+  CapAddrPlus2 baseMask = -1; // Override the result from the previous line if
+                              // we represent everything.
+  if (intExp) begin
+    CapAddrPlus2 oneInLsb = (lmask ^ (lmask>>1)) >> shiftAmount;
+    CapAddrPlus2 newLengthRounded = newLength + oneInLsb;
+    newLength        = (newLength        & (~lmaskLor));
+    newLengthRounded = (newLengthRounded & (~lmaskLor));
+    if (lostSignificantLen) newLength = newLengthRounded;
+    baseMask = (lengthIsMax && lostSignificantTop) ? ~lmaskLo : ~lmaskLor;
+  end
+
+  // In parallel, work out if the result is going to be in bounds
+
+  // Base computation simple since tf and addrBits already extracted
+  // Logic same as capInBounds
+  Bool newBaseInBounds = (tf.baseHi == tf.addrHi) ? cap.addrBits >= cap.bounds.baseBits
+                                                  : tf.addrHi;
+
+  // Interpret the requested length relative to the authorising cap
+  CapAddr lengthShifted = length >> cap.bounds.exp;
+
+  // Split the length into the mantissa, and the bits that overflowed
+  Bit#(TSub#(CapAddrW, MW)) lengthExcess = truncateLSB(lengthShifted);
+  Bit#(MW) lengthBits = truncate(lengthShifted);
+
+  // If length didn't fit into the mantissa, it's definitely too big
+  Bool lengthDisqualified = lengthExcess != 0;
+
+  // Compute the new top bits, assuming the same exponent
+  Bit#(TAdd#(MW, 1)) reqTopBits = {1'b0,cap.addrBits} + {1'b0,lengthBits};
+
+  // Find the difference between the current and new top bits
+  Int#(TAdd#(MW, 2)) topDiff = unpack({pack(tf.topCorrection), cap.bounds.topBits} - {1'b0,reqTopBits});
+
+  // Compute on bits below the mantissa for edge cases
+  CapAddrPlus2 lowMask = ~((~0) << cap.bounds.exp);
+  CapAddrPlus2 carryMask = ~lowMask & (lowMask << 1);
+
+  // Recover carry inputs to each bit of top calculation
+  CapAddrPlus2 carries = len ^ base ^ top;
+
+  Bool lowCarry = (carries & carryMask) != 0;
+  Bool lowRemainder = (top & lowMask) != 0;
+
+  // Address the cases for the top: difference in the mantissa bits dictates slack in the lower bits
+  Bool newTopInBounds = !lengthDisqualified && (
+                             topDiff > 1
+                          || (topDiff == 1 && !(lowCarry && lowRemainder))
+                          || (topDiff == 0 && !(lowCarry || lowRemainder))
+                        );
+
+  // Address the last case: address is zero being interpreted as the top of the address space.
+  Bool addressWrap = len == 0 && cap.address == 0 && cap.bounds.baseBits != 0;
+
+  Bool resultInBounds = newBaseInBounds && newTopInBounds && !addressWrap;
+
+  // Nullify the capability if the result is not in bounds
+  if (!resultInBounds) ret.isCapability = False;
+
+  // Return derived capability
+  return SetBoundsReturn { cap:    ret
+                         , exact:  exact
+                         , length: truncate(newLength)
+                         , mask:   truncate(baseMask)
+                         , inBounds: resultInBounds };
+endfunction
+
+/* #### END Pipelined SetBounds #### */
+
 function SetBoundsReturn#(CapFat, CapAddrW) setBoundsFat(CapFat cap, Address lengthFull, TempFields tf);
   CapFat ret = cap;
   // Find new exponent by finding the index of the most significant bit of the
@@ -678,6 +928,8 @@ function SetBoundsReturn#(CapFat, CapAddrW) setBoundsFat(CapFat cap, Address len
                          , mask:   truncate(baseMask)
                          , inBounds: resultInBounds };
 endfunction
+
+
 function CapFat seal(CapFat cap, TempFields tf, CType otype);
   CapFat ret = cap;
   // Update the fields of the new sealed capability (otype)
@@ -1036,7 +1288,7 @@ typedef struct {
 // Note: commented out methods have a provided default implementation in the
 //       CHERICap typeclass definition
 
-instance CHERICap #(CapMem, OTypeW, FlagsW, CapAddrW, CapW, TSub #(MW, 3));
+instance CHERICap #(CapMem, OTypeW, FlagsW, CapAddrW, CapW, TSub #(MW, 3), SetBoundsIntermediary);
 
   // capability validity
   //////////////////////////////////////////////////////////////////////////////
@@ -1194,7 +1446,7 @@ endinstance
 // Note: commented out methods have a provided default implementation in the
 //       CHERICap typeclass definition
 
-instance CHERICap #(CapReg, OTypeW, FlagsW, CapAddrW, CapW, TSub #(MW, 3));
+instance CHERICap #(CapReg, OTypeW, FlagsW, CapAddrW, CapW, TSub #(MW, 3), SetBoundsIntermediary);
 
   // capability validity
   //////////////////////////////////////////////////////////////////////////////
@@ -1342,7 +1594,8 @@ instance CHERICap #(CapReg, OTypeW, FlagsW, CapAddrW, CapW, TSub #(MW, 3));
 
 endinstance
 
-instance CHERICap #(CapPipe, OTypeW, FlagsW, CapAddrW, CapW, TSub#(MW, 3));
+instance CHERICap #(CapPipe, OTypeW, FlagsW, CapAddrW, CapW, TSub#(MW, 3), SetBoundsIntermediary);
+
 
   //Functions supported by CapReg are just passed through
 
@@ -1381,6 +1634,8 @@ instance CHERICap #(CapPipe, OTypeW, FlagsW, CapAddrW, CapW, TSub#(MW, 3));
 
   function setBoundsCombined (cap, length);
     let result = setBoundsFat(cap.capFat, length, cap.tempFields);
+    //let intermediate = setBoundsFat_a(cap.capFat, length, cap.tempFields);
+    //let result = setBoundsFat_b(intermediate);
     return SetBoundsReturn {
         cap: CapPipe { capFat: result.cap
                      , tempFields: getTempFields(result.cap) }
@@ -1388,6 +1643,22 @@ instance CHERICap #(CapPipe, OTypeW, FlagsW, CapAddrW, CapW, TSub#(MW, 3));
       , inBounds: result.inBounds
       , length: result.length
       , mask: result.mask };
+  endfunction
+
+  function setBounds_a (cap, length);
+    return setBoundsFat_a(cap.capFat, length, cap.tempFields);
+  endfunction
+
+  function setBounds_b (inter);
+    let result = setBoundsFat_b(inter);
+    let result2 = SetBoundsReturn {
+        cap: CapPipe { capFat: result.cap
+                     , tempFields: getTempFields(result.cap) }
+      , exact: result.exact
+      , inBounds: result.inBounds
+      , length: result.length
+      , mask: result.mask };
+    return Exact {exact: result2.exact, value: result2.cap};
   endfunction
 
   function nullWithAddr (addr);
